@@ -1,0 +1,43 @@
+name: healthapp-ci
+
+on:
+  push:
+    paths: ["healthapp/**", ".github/workflows/healthapp-ci.yml"]
+  pull_request:
+    paths: ["healthapp/**", ".github/workflows/healthapp-ci.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: healthapp/backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: if [ -f package-lock.json ]; then npm ci; else npm install; fi
+      - run: npm test
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+      - run: sam validate --lint --template template.yaml
+
+  ios:
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: healthapp/ios
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install xcodegen
+      - run: xcodegen generate
+      - name: Test HealthAppKit package
+        working-directory: healthapp/ios/Packages/HealthAppKit
+        run: xcodebuild test -scheme HealthAppKit-Package -destination 'platform=iOS Simulator,name=iPhone 16' -skipMacroValidation
+      - name: Build app
+        run: xcodebuild build -project HealthApp.xcodeproj -scheme HealthApp -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO
