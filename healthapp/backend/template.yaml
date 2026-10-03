@@ -1,0 +1,706 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  HealthApp serverless backend — Cognito (Sign in with Apple), HTTP API + JWT authorizer,
+  Lambda (Node.js 22, arm64), DynamoDB, S3, KMS, Secrets Manager, SQS, EventBridge Scheduler,
+  SNS mobile push (APNs) and Claude on Amazon Bedrock.
+
+Parameters:
+  Stage:
+    Type: String
+    AllowedValues: [dev, prod]
+    Default: dev
+  BedrockModelId:
+    Type: String
+    Default: anthropic.claude-opus-5-5
+    Description: Claude model id on Bedrock (Mantle Messages endpoint).
+  BedrockRegion:
+    Type: String
+    Default: ""
+    Description: Region for Bedrock calls (empty = stack region).
+  CognitoDomainPrefix:
+    Type: String
+    Default: healthapp
+    Description: Hosted UI domain prefix; the stage is appended (must be globally unique per region).
+  AppleServicesId:
+    Type: String
+    Description: Apple Services ID (e.g. com.example.healthapp.signin) used as the client_id.
+  AppleTeamId:
+    Type: String
+    Description: Apple Developer Team ID.
+  AppleKeyId:
+    Type: String
+    Description: Key ID of the Sign in with Apple private key.
+  ApplePrivateKey:
+    Type: String
+    NoEcho: true
+    Description: Contents of the .p8 Sign in with Apple private key.
+  ApnsPlatformApplicationArn:
+    Type: String
+    Default: ""
+    Description: Optional SNS platform application ARN (APNs). Empty disables push notifications.
+  AppScheme:
+    Type: String
+    Default: healthapp
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+
+Conditions:
+  IsProd: !Equals [!Ref Stage, prod]
+  HasPush: !Not [!Equals [!Ref ApnsPlatformApplicationArn, ""]]
+  HasBedrockRegion: !Not [!Equals [!Ref BedrockRegion, ""]]
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures: [arm64]
+    Tracing: Active
+    MemorySize: 512
+    Timeout: 29
+    CodeUri: ./
+    Environment:
+      Variables:
+        STAGE: !Ref Stage
+        TABLE_NAME: !Ref DataTable
+        CATALOG_TABLE_NAME: !Ref CatalogTable
+        MEDIA_BUCKET: !Ref MediaBucket
+        TOKEN_KEY_ID: !GetAtt TokenKey.Arn
+        OURA_SECRET_ARN: !Ref OuraSecret
+        USDA_SECRET_ARN: !Ref UsdaSecret
+        OURA_QUEUE_URL: !Ref OuraWebhookQueue
+        PLATFORM_APPLICATION_ARN: !Ref ApnsPlatformApplicationArn
+        BEDROCK_MODEL_ID: !Ref BedrockModelId
+        BEDROCK_REGION: !If [HasBedrockRegion, !Ref BedrockRegion, !Ref AWS::Region]
+        APP_SCHEME: !Ref AppScheme
+        NODE_OPTIONS: --enable-source-maps
+        LOG_LEVEL: info
+
+Resources:
+  # ── KMS ────────────────────────────────────────────────────────────────────────────────────
+  DataKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub HealthApp ${Stage} data key (DynamoDB tables, S3 media)
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdmin
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: kms:*
+            Resource: "*"
+  DataKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/healthapp-${Stage}-data
+      TargetKeyId: !Ref DataKey
+
+  TokenKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub HealthApp ${Stage} OAuth token envelope key
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdmin
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: kms:*
+            Resource: "*"
+  TokenKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/healthapp-${Stage}-token
+      TargetKeyId: !Ref TokenKey
+
+  # ── DynamoDB ───────────────────────────────────────────────────────────────────────────────
+  DataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub HealthAppData-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: PK, AttributeType: S }
+        - { AttributeName: SK, AttributeType: S }
+        - { AttributeName: GSI1PK, AttributeType: S }
+        - { AttributeName: GSI1SK, AttributeType: S }
+        - { AttributeName: GSI2PK, AttributeType: S }
+        - { AttributeName: GSI2SK, AttributeType: S }
+      KeySchema:
+        - { AttributeName: PK, KeyType: HASH }
+        - { AttributeName: SK, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - { AttributeName: GSI1PK, KeyType: HASH }
+            - { AttributeName: GSI1SK, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        - IndexName: GSI2
+          KeySchema:
+            - { AttributeName: GSI2PK, KeyType: HASH }
+            - { AttributeName: GSI2SK, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DataKey
+      DeletionProtectionEnabled: !If [IsProd, true, false]
+
+  CatalogTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub HealthAppFoodCatalog-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: PK, AttributeType: S }
+        - { AttributeName: SK, AttributeType: S }
+      KeySchema:
+        - { AttributeName: PK, KeyType: HASH }
+        - { AttributeName: SK, KeyType: RANGE }
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DataKey
+      DeletionProtectionEnabled: !If [IsProd, true, false]
+
+  # ── S3 media ───────────────────────────────────────────────────────────────────────────────
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub healthapp-${Stage}-user-media-${AWS::AccountId}
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt DataKey.Arn
+            BucketKeyEnabled: true
+      # Lifecycle filters cannot wildcard `users/<sub>/`, so retention is tag-driven: uploads of
+      # `users/*/meals/*` carry retention=meal-30d (presigned PUT signs the tag), exports carry
+      # retention=export-7d. Pinning replaces the tag set with pinned=true → no expiry.
+      LifecycleConfiguration:
+        Rules:
+          - Id: meal-photos-30d-unless-pinned
+            Status: Enabled
+            TagFilters: [{ Key: retention, Value: meal-30d }]
+            ExpirationInDays: 30
+          - Id: exports-7d
+            Status: Enabled
+            TagFilters: [{ Key: retention, Value: export-7d }]
+            ExpirationInDays: 7
+          - Id: abort-incomplete-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 }
+
+  MediaBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MediaBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt MediaBucket.Arn
+              - !Sub "${MediaBucket.Arn}/*"
+            Condition:
+              Bool: { aws:SecureTransport: "false" }
+          - Sid: DenyOldTls
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt MediaBucket.Arn
+              - !Sub "${MediaBucket.Arn}/*"
+            Condition:
+              NumericLessThan: { s3:TlsVersion: "1.2" }
+
+  # ── Cognito (Sign in with Apple) ───────────────────────────────────────────────────────────
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub healthapp-${Stage}
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true # no username/password sign-up; Apple federation only
+      UsernameConfiguration: { CaseSensitive: false }
+      AccountRecoverySetting:
+        RecoveryMechanisms: [{ Name: admin_only, Priority: 1 }]
+      DeletionProtection: !If [IsProd, ACTIVE, INACTIVE]
+      UserPoolTier: ESSENTIALS
+
+  AppleIdentityProvider:
+    Type: AWS::Cognito::UserPoolIdentityProvider
+    Properties:
+      UserPoolId: !Ref UserPool
+      ProviderName: SignInWithApple
+      ProviderType: SignInWithApple
+      ProviderDetails:
+        client_id: !Ref AppleServicesId
+        team_id: !Ref AppleTeamId
+        key_id: !Ref AppleKeyId
+        private_key: !Ref ApplePrivateKey
+        authorize_scopes: email name
+      AttributeMapping:
+        email: email
+        email_verified: email_verified
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Sub ${CognitoDomainPrefix}-${Stage}
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: AppleIdentityProvider
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub healthapp-ios-${Stage}
+      GenerateSecret: false # public client; PKCE is used by the app
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      CallbackURLs: [healthapp://auth/callback]
+      LogoutURLs: [healthapp://auth/signout]
+      SupportedIdentityProviders: [SignInWithApple]
+      ExplicitAuthFlows: [ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits: { AccessToken: minutes, IdToken: minutes, RefreshToken: days }
+
+  # ── Secrets ────────────────────────────────────────────────────────────────────────────────
+  OuraSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub healthapp/${Stage}/oura
+      Description: "Oura OAuth app: fill clientId/clientSecret after registering the app"
+      KmsKeyId: !Ref TokenKey
+      GenerateSecretString:
+        SecretStringTemplate: '{"clientId":"REPLACE_ME","clientSecret":"REPLACE_ME"}'
+        GenerateStringKey: webhookVerificationToken
+        PasswordLength: 40
+        ExcludePunctuation: true
+
+  UsdaSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub healthapp/${Stage}/usda-fdc
+      Description: USDA FoodData Central API key
+      SecretString: '{"apiKey":"REPLACE_ME"}'
+
+  # ── SQS (Oura webhooks) ────────────────────────────────────────────────────────────────────
+  OuraWebhookDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  OuraWebhookQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 360 # 6 × worker timeout
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OuraWebhookDLQ.Arn
+        maxReceiveCount: 5
+
+  OuraWebhookQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref OuraWebhookQueue, !Ref OuraWebhookDLQ]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: sqs:*
+            Resource: [!GetAtt OuraWebhookQueue.Arn, !GetAtt OuraWebhookDLQ.Arn]
+            Condition:
+              Bool: { aws:SecureTransport: "false" }
+
+  # ── HTTP API ───────────────────────────────────────────────────────────────────────────────
+  ApiAccessLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/healthapp-${Stage}
+      RetentionInDays: !Ref LogRetentionDays
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+      Auth:
+        DefaultAuthorizer: CognitoJwt
+        Authorizers:
+          CognitoJwt:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+              audience: [!Ref UserPoolClient]
+      DefaultRouteSettings:
+        ThrottlingRateLimit: 20
+        ThrottlingBurstLimit: 40
+      # No request/response bodies are logged.
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogs.Arn
+        Format: '{"requestId":"$context.requestId","routeKey":"$context.routeKey","status":"$context.status","latency":"$context.responseLatency","integrationError":"$context.integrationErrorMessage","authorizerError":"$context.authorizer.error"}'
+
+  # ── Functions ──────────────────────────────────────────────────────────────────────────────
+  ProfileFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub healthapp-${Stage}-profile
+      Handler: src/handlers/profile.handler
+      Timeout: 60
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:BatchWriteItem]
+              Resource: [!GetAtt DataTable.Arn, !Sub "${DataTable.Arn}/index/*"]
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !GetAtt MediaBucket.Arn
+              Condition: { StringLike: { s3:prefix: ["users/*"] } }
+            - Effect: Allow
+              Action: [s3:GetObject, s3:PutObject, s3:PutObjectTagging, s3:DeleteObject]
+              Resource: !Sub "${MediaBucket.Arn}/users/*"
+            - Effect: Allow
+              Action: [kms:Decrypt, kms:GenerateDataKey]
+              Resource: [!GetAtt DataKey.Arn, !GetAtt TokenKey.Arn]
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref OuraSecret
+            - !If
+              - HasPush
+              - Effect: Allow
+                Action: [sns:CreatePlatformEndpoint, sns:SetEndpointAttributes, sns:DeleteEndpoint]
+                Resource:
+                  - !Ref ApnsPlatformApplicationArn
+                  - !Sub "arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:endpoint/*"
+              - !Ref AWS::NoValue
+      Events:
+        GetMe: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: /v1/me } }
+        PutMe: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: PUT, Path: /v1/me } }
+        DeleteMe: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: DELETE, Path: /v1/me } }
+        PutGoals: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: PUT, Path: /v1/me/goals } }
+        Export: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: /v1/me/export } }
+        ListConnections: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: /v1/connections } }
+        PutConnection: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: PUT, Path: "/v1/connections/{provider}" } }
+        PostDevice: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: /v1/devices } }
+
+  NutritionFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub healthapp-${Stage}-nutrition
+      Handler: src/handlers/nutrition.handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query]
+              Resource: [!GetAtt DataTable.Arn, !Sub "${DataTable.Arn}/index/*"]
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem]
+              Resource: !GetAtt CatalogTable.Arn
+            - Effect: Allow
+              Action: [s3:PutObjectTagging, s3:DeleteObject]
+              Resource: !Sub "${MediaBucket.Arn}/users/*/meals/*"
+            - Effect: Allow
+              Action: [kms:Decrypt, kms:GenerateDataKey]
+              Resource: !GetAtt DataKey.Arn
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref UsdaSecret
+      Events:
+        ListMeals: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: /v1/meals } }
+        PutMeal: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: PUT, Path: "/v1/meals/{id}" } }
+        DeleteMeal: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: DELETE, Path: "/v1/meals/{id}" } }
+        SearchFoods: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: /v1/foods/search } }
+        Barcode: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: "/v1/foods/barcode/{gtin}" } }
+        GetFood: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: "/v1/foods/{db}/{id}" } }
+        PutCustomFood: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: PUT, Path: "/v1/foods/custom/{id}" } }
+        ListRecipes: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: /v1/recipes } }
+        GetRecipe: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: "/v1/recipes/{id}" } }
+        PutRecipe: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: PUT, Path: "/v1/recipes/{id}" } }
+        DeleteRecipe: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: DELETE, Path: "/v1/recipes/{id}" } }
+
+  HealthFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub healthapp-${Stage}-health
+      Handler: src/handlers/health.handler
+      MemorySize: 1024
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Query]
+              Resource: [!GetAtt DataTable.Arn, !Sub "${DataTable.Arn}/index/*"]
+      Events:
+        PostDaily: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: /v1/metrics/daily } }
+        GetDaily: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: /v1/metrics/daily } }
+        PostBody: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: /v1/body } }
+        GetBody: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: /v1/body } }
+        PostWorkouts: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: /v1/workouts } }
+        GetWorkouts: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: /v1/workouts } }
+        PutNote: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: PUT, Path: "/v1/notes/{date}" } }
+        PutCycle: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: PUT, Path: "/v1/cycle/{date}" } }
+        GetDay: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: "/v1/day/{date}" } }
+        Compare: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: /v1/trends/compare } }
+        Trend: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: "/v1/trends/{metric}" } }
+
+  AiFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub healthapp-${Stage}-ai
+      Handler: src/handlers/ai.handler
+      MemorySize: 1024
+      Timeout: 29 # HTTP API integration limit
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query]
+              Resource: [!GetAtt DataTable.Arn, !Sub "${DataTable.Arn}/index/*"]
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem]
+              Resource: !GetAtt CatalogTable.Arn
+            - Effect: Allow
+              Action: [s3:GetObject, s3:PutObject]
+              Resource: !Sub "${MediaBucket.Arn}/users/*/meals/*"
+            - Effect: Allow
+              Action: [kms:Decrypt, kms:GenerateDataKey]
+              Resource: !GetAtt DataKey.Arn # media only — no access to the token key
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref UsdaSecret
+            - Sid: BedrockClassicRuntime
+              Effect: Allow
+              Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+              Resource:
+                - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/${BedrockModelId}*"
+                - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*"
+            - Sid: BedrockMantleMessages
+              # The Mantle Messages endpoint signs requests for the `bedrock-mantle` service.
+              # Narrow this to the exact action(s) documented for your region once confirmed.
+              Effect: Allow
+              Action: bedrock-mantle:*
+              Resource: "*"
+      Events:
+        UploadUrl: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: /v1/photos/upload-url } }
+        MealAnalysis: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: /v1/ai/meal-analysis } }
+        VoiceParse: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: /v1/ai/voice-parse } }
+        Coach: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: /v1/ai/coach } }
+
+  OuraFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub healthapp-${Stage}-oura
+      Handler: src/handlers/oura.handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query]
+              Resource: [!GetAtt DataTable.Arn, !Sub "${DataTable.Arn}/index/*"]
+            - Effect: Allow
+              Action: [kms:Decrypt, kms:GenerateDataKey]
+              Resource: [!GetAtt TokenKey.Arn, !GetAtt DataKey.Arn]
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref OuraSecret
+            - Effect: Allow
+              Action: sqs:SendMessage
+              Resource: !GetAtt OuraWebhookQueue.Arn
+      Events:
+        Authorize: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: /v1/integrations/oura/authorize } }
+        Callback: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: /v1/integrations/oura/callback, Auth: { Authorizer: NONE } } }
+        Sync: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: /v1/integrations/oura/sync } }
+        Disconnect: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: DELETE, Path: /v1/integrations/oura } }
+        WebhookPost: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: /v1/webhooks/oura, Auth: { Authorizer: NONE } } }
+        WebhookVerify: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: /v1/webhooks/oura, Auth: { Authorizer: NONE } } }
+
+  SyncFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub healthapp-${Stage}-sync
+      Handler: src/handlers/sync.handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Query]
+              Resource: [!GetAtt DataTable.Arn, !Sub "${DataTable.Arn}/index/*"]
+      Events:
+        Push: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: /v1/sync/push } }
+        Pull: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: /v1/sync/pull } }
+
+  OuraSyncScheduledFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub healthapp-${Stage}-oura-sync-scheduled
+      Handler: src/handlers/ouraSyncScheduled.handler
+      Timeout: 900
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query, dynamodb:Scan]
+              Resource: [!GetAtt DataTable.Arn, !Sub "${DataTable.Arn}/index/*"]
+            - Effect: Allow
+              Action: [kms:Decrypt, kms:GenerateDataKey]
+              Resource: !GetAtt TokenKey.Arn
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref OuraSecret
+      Events:
+        Hourly:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: rate(1 hour)
+            RetryPolicy: { MaximumRetryAttempts: 0 }
+
+  OuraWebhookWorkerFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub healthapp-${Stage}-oura-webhook-worker
+      Handler: src/handlers/ouraWebhookWorker.handler
+      Timeout: 60
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query]
+              Resource: [!GetAtt DataTable.Arn, !Sub "${DataTable.Arn}/index/*"]
+            - Effect: Allow
+              Action: [kms:Decrypt, kms:GenerateDataKey]
+              Resource: !GetAtt TokenKey.Arn
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref OuraSecret
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OuraWebhookQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 20
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+  NotificationsScheduledFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub healthapp-${Stage}-notifications-scheduled
+      Handler: src/handlers/notificationsScheduled.handler
+      Timeout: 600
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query, dynamodb:Scan]
+              Resource: [!GetAtt DataTable.Arn, !Sub "${DataTable.Arn}/index/*"]
+            - !If
+              - HasPush
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Sub "arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:endpoint/*"
+              - !Ref AWS::NoValue
+      Events:
+        Every15Min:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: rate(15 minutes)
+            RetryPolicy: { MaximumRetryAttempts: 0 }
+
+  TombstonePurgeFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub healthapp-${Stage}-tombstone-purge
+      Handler: src/handlers/tombstonePurge.handler
+      Timeout: 900
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:Scan, dynamodb:BatchWriteItem]
+              Resource: !GetAtt DataTable.Arn
+            - Effect: Allow
+              Action: s3:DeleteObject
+              Resource: !Sub "${MediaBucket.Arn}/users/*/meals/*"
+      Events:
+        Daily:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: rate(1 day)
+
+  # ── Log groups (30-day retention) ──────────────────────────────────────────────────────────
+  ProfileFnLogs: { Type: AWS::Logs::LogGroup, Properties: { LogGroupName: !Sub "/aws/lambda/${ProfileFn}", RetentionInDays: !Ref LogRetentionDays } }
+  NutritionFnLogs: { Type: AWS::Logs::LogGroup, Properties: { LogGroupName: !Sub "/aws/lambda/${NutritionFn}", RetentionInDays: !Ref LogRetentionDays } }
+  HealthFnLogs: { Type: AWS::Logs::LogGroup, Properties: { LogGroupName: !Sub "/aws/lambda/${HealthFn}", RetentionInDays: !Ref LogRetentionDays } }
+  AiFnLogs: { Type: AWS::Logs::LogGroup, Properties: { LogGroupName: !Sub "/aws/lambda/${AiFn}", RetentionInDays: !Ref LogRetentionDays } }
+  OuraFnLogs: { Type: AWS::Logs::LogGroup, Properties: { LogGroupName: !Sub "/aws/lambda/${OuraFn}", RetentionInDays: !Ref LogRetentionDays } }
+  SyncFnLogs: { Type: AWS::Logs::LogGroup, Properties: { LogGroupName: !Sub "/aws/lambda/${SyncFn}", RetentionInDays: !Ref LogRetentionDays } }
+  OuraSyncScheduledFnLogs: { Type: AWS::Logs::LogGroup, Properties: { LogGroupName: !Sub "/aws/lambda/${OuraSyncScheduledFn}", RetentionInDays: !Ref LogRetentionDays } }
+  OuraWebhookWorkerFnLogs: { Type: AWS::Logs::LogGroup, Properties: { LogGroupName: !Sub "/aws/lambda/${OuraWebhookWorkerFn}", RetentionInDays: !Ref LogRetentionDays } }
+  NotificationsScheduledFnLogs: { Type: AWS::Logs::LogGroup, Properties: { LogGroupName: !Sub "/aws/lambda/${NotificationsScheduledFn}", RetentionInDays: !Ref LogRetentionDays } }
+  TombstonePurgeFnLogs: { Type: AWS::Logs::LogGroup, Properties: { LogGroupName: !Sub "/aws/lambda/${TombstonePurgeFn}", RetentionInDays: !Ref LogRetentionDays } }
+
+  # ── Alarms ─────────────────────────────────────────────────────────────────────────────────
+  OuraDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Oura webhook messages landed in the DLQ
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{ Name: QueueName, Value: !GetAtt OuraWebhookDLQ.QueueName }]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  ApiUrl:
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}
+  UserPoolId:
+    Value: !Ref UserPool
+  ClientId:
+    Value: !Ref UserPoolClient
+  HostedUiDomain:
+    Value: !Sub ${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com
+  AppleReturnUrl:
+    Description: Register this as the Return URL of the Apple Services ID
+    Value: !Sub https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/idpresponse
+  OuraRedirectUri:
+    Description: Register this as the Oura app redirect URI
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/v1/integrations/oura/callback
+  OuraWebhookUrl:
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/v1/webhooks/oura
+  BucketName:
+    Value: !Ref MediaBucket
+  DataTableName:
+    Value: !Ref DataTable
+  OuraSecretArn:
+    Value: !Ref OuraSecret
+  UsdaSecretArn:
+    Value: !Ref UsdaSecret

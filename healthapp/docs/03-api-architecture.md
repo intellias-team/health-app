@@ -25,7 +25,7 @@ Oura webhooks ─▶ POST /v1/webhooks/oura (public, signature-verified) ─▶ 
 * **Errors**: `{ "error": { "code": "VALIDATION_ERROR", "message": "…", "details": {…} } }` with 400/401/403/404/409/413/422/429/500/502.
 * **Idempotency**: mutating requests accept `Idempotency-Key` header (the client's entity UUID); writes are upserts keyed on client UUIDs.
 * **Versioning**: path prefix `/v1`; additive changes only within a version.
-* **Rate limits**: API Gateway stage/route throttling (20 rps, burst 40; HTTP APIs can't throttle per user), per-user AI limit of 30 requests/hour via a DynamoDB counter (`RATE#ai#…`), and WAF rate-based rules in prod.
+* **Rate limits**: API Gateway stage/route throttling (20 rps, burst 40; HTTP APIs can't throttle per user), per-user AI limit of 30 requests/hour via a DynamoDB counter (`RATE#ai#…`), and (prod) CloudFront + WAF rate-based rules in front of the API — AWS WAF cannot attach to an HTTP API directly.
 
 ## 3.2 Lambda functions (one per bounded context)
 
@@ -62,8 +62,8 @@ All routes require `Authorization: Bearer <Cognito access token>` unless marked 
 | Method | Path | Body / Query | Response |
 |---|---|---|---|
 | GET | `/v1/meals` | `from`, `to` (dates) | `{ meals[] }` |
-| PUT | `/v1/meals/{id}` | `Meal` (client UUID, upsert, `version` for concurrency) | `{ meal }` (server recomputes `totals`) |
-| DELETE | `/v1/meals/{id}` | — | `204` (tombstone) |
+| PUT | `/v1/meals/{id}` | `Meal` (client UUID, upsert, `version` for concurrency; optional `previousDate` when moved to another day, `photoPinned`) | `{ meal }` (server recomputes `totals`) |
+| DELETE | `/v1/meals/{id}` | `date?` (query; speeds up lookup) | `204` (tombstone) |
 | GET | `/v1/foods/search` | `q`, `limit≤25` | `{ foods: FoodSummary[] }` (USDA FDC + user custom foods) |
 | GET | `/v1/foods/barcode/{gtin}` | — | `{ food }` or 404 |
 | GET | `/v1/foods/{db}/{id}` | — | `{ food: FoodDetail }` (nutrients per 100 g + portions) |
@@ -90,7 +90,7 @@ Trend metric ids: `weight, bodyFatPct, muscleMassKg, kcalIn, proteinG, carbsG, f
 ### AI
 | Method | Path | Body | Response |
 |---|---|---|---|
-| POST | `/v1/photos/upload-url` | `{ mealId, contentType: "image/jpeg" }` | `{ uploadUrl, photoKey, expiresIn }` |
+| POST | `/v1/photos/upload-url` | `{ mealId, contentType: "image/jpeg", contentLength? }` | `{ uploadUrl, photoKey, expiresIn, requiredHeaders, maxBytes }` — the client must send every header in `requiredHeaders` (content-type, retention tag) on the PUT |
 | POST | `/v1/ai/meal-analysis` | `{ photoKey, scaleReadings?: [{ grams, label? }], hint?, mealCategory? }` | `MealAnalysis` (below) |
 | POST | `/v1/ai/voice-parse` | `{ transcript, mealCategory? }` | `{ items: AnalyzedItem[] }` |
 | POST | `/v1/ai/coach` | `{ conversationId, message }` | `{ reply, citations: [{ metric, from, to }], disclaimer? }` |
@@ -150,4 +150,4 @@ Nutrients are **always computed server-side from the nutrition database × grams
 * Oura webhook: HMAC-SHA256 signature check with the client secret + timestamp skew ≤ 5 min.
 * Bedrock prompts contain only the photo and food-level context — no name, email or Apple ID.
 * CloudWatch logs scrub bodies (structured logger logs route, status, latency, `sub` hash only). 30-day log retention.
-* WAF (prod) with AWS managed rule groups on the API stage.
+* WAF (prod) via CloudFront in front of the HTTP API, with AWS managed rule groups.

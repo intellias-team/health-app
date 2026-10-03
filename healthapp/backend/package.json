@@ -1,0 +1,27 @@
+{
+  "name": "healthapp-backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "HealthApp AWS serverless backend (SAM, Lambda Node.js 22 ESM)",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.js\"",
+    "test:watch": "node --test --watch \"test/**/*.test.js\"",
+    "build": "sam build",
+    "deploy": "sam deploy --guided"
+  },
+  "dependencies": {
+    "@anthropic-ai/bedrock-sdk": "^0.34.2",
+    "@aws-sdk/client-dynamodb": "^3.1146.0",
+    "@aws-sdk/client-kms": "^3.1146.0",
+    "@aws-sdk/client-s3": "^3.1146.0",
+    "@aws-sdk/client-secrets-manager": "^3.1146.0",
+    "@aws-sdk/client-sns": "^3.1146.0",
+    "@aws-sdk/client-sqs": "^3.1146.0",
+    "@aws-sdk/lib-dynamodb": "^3.1146.0",
+    "@aws-sdk/s3-request-presigner": "^3.1146.0"
+  }
+}
