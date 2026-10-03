@@ -28,7 +28,7 @@
 | `id` | S | UUID v4 (client-generated for offline creation) |
 | `updatedAt` | S | ISO-8601 UTC, server-stamped on write |
 | `version` | N | Optimistic-concurrency counter (conditional write `version = :expected`) |
-| `deleted` | BOOL | Tombstone; tombstones purged after 90 days via TTL |
+| `deleted` | BOOL | Tombstone; `expiresAt` set to +90 days on delete so TTL purges it (the daily `tombstonePurge` job is a backstop + orphaned-photo cleanup) |
 | `expiresAt` | N | TTL (optional) |
 
 **GSI1** (`GSI1PK`, `GSI1SK`, projection ALL) — the sync change feed.
@@ -43,7 +43,7 @@
 | Source permission / connection | `USER#<sub>` | `CONNECTION#<provider>` | `provider ("healthkit","oura","bodyscale:<id>","foodscale:<id>")`, `status ("connected","revoked","error")`, `scopes[]`, `enabledMetrics[]`, `lastSyncAt`, `lastError?`, `tokenCiphertext?` (Oura only, KMS-encrypted JSON `{access_token, refresh_token, expires_at}`), `ouraUserId?`, `GSI2PK?` |
 | Meal | `USER#<sub>` | `MEAL#<yyyy-mm-dd>#<mealId>` | see 2.2.2 |
 | Daily metrics | `USER#<sub>` | `DAY#<yyyy-mm-dd>#<source>` | `date, source ("healthkit"/"oura"/"manual")`, `metrics` map (see 2.2.3) |
-| Body measurement | `USER#<sub>` | `BODY#<ISO timestamp>#<id>` | `measuredAt, source, weightKg?, bodyFatPct?, muscleMassKg?, bmi?, visceralFat?, waterPct?, boneMassKg?, bmrKcal?` |
+| Body measurement | `USER#<sub>` | `BODY#<ISO timestamp>#<id>` | `measuredAt, source, weightKg?, bodyFatPct?, leanMassKg?, muscleMassKg?, bmi?, visceralFat?, waterPct?, boneMassKg?, bmrKcal?` — HealthKit `leanBodyMass` → `leanMassKg`; scale-reported skeletal/muscle mass → `muscleMassKg` (different measures, never merged) |
 | Workout | `USER#<sub>` | `WORKOUT#<ISO start>#<id>` | `start, end, type, source, durationMin, activeKcal?, avgHr?, maxHr?, distanceM?, strain/load (TRIMP)?, externalId` |
 | Custom food | `USER#<sub>` | `FOOD#<id>` | `name, brand?, servingG, nutrientsPer100g` |
 | Recipe / saved meal | `USER#<sub>` | `RECIPE#<id>` | `name, kind ("recipe"/"savedMeal"), items[] (FoodItem), totalCookedWeightG?, servings` |
@@ -52,7 +52,10 @@
 | Device | `USER#<sub>` | `DEVICE#<id>` | `apnsToken, platform, appVersion, notificationPrefs` |
 | Meal analysis job | `USER#<sub>` | `ANALYSIS#<id>` | `photoKey, status, result, model, createdAt, expiresAt (+7d)` |
 | Coach message | `USER#<sub>` | `CHAT#<conversationId>#<ISO ts>` | `role, text, citations[]` , `expiresAt (+90d)` |
-| OAuth state | `OAUTHSTATE#<state>` | `STATE` | `sub, codeVerifier, provider, expiresAt (+10 min)` |
+| OAuth state | `OAUTHSTATE#<state>` | `STATE` | `sub, codeVerifier?, provider, expiresAt (+10 min)` (PKCE verifier only if the provider supports PKCE; the server-side client secret protects the exchange regardless) |
+| AI rate counter | `USER#<sub>` | `RATE#ai#<yyyy-mm-ddThh>` | `count`, `expiresAt (+2h)` — 30 AI calls / user / hour |
+| Notification log | `USER#<sub>` | `NOTIFLOG#<kind>#<yyyy-mm-dd>` | `sentAt`, `expiresAt (+14d)` — de-duplicates reminders |
+| Oura app-wide rate window | `SYSTEM#oura` | `RATE#<window>` | `count`, `expiresAt` — protects the shared Oura client quota |
 
 ### 2.2.2 Meal item
 
@@ -94,10 +97,10 @@
 | `steps` | count | `stepCount` | `daily_activity.steps` |
 | `activeKcal` | kcal | `activeEnergyBurned` | `daily_activity.active_calories` |
 | `restingKcal` | kcal | `basalEnergyBurned` | — (derived: `total_calories − active_calories`) |
-| `restingHr` | bpm | `restingHeartRate` | `sleep.lowest_heart_rate` |
+| `restingHr` | bpm | `restingHeartRate` | `sleep.lowest_heart_rate` — stored with `restingHrMethod: "sleepLowest"`; not identical to Apple's measure, so trends never mix sources |
 | `hrvMs` | ms | `heartRateVariabilitySDNN` | `sleep.average_hrv` (RMSSD) — stored with `hrvMethod` |
 | `sleepMinutes` | min | `sleepAnalysis` (asleep*) | `sleep.total_sleep_duration / 60` |
-| `sleepStages` | min map | `asleepCore/Deep/REM`, `awake` | `deep/rem/light/awake_time` |
+| `sleepStages` | min map `{coreMin, deepMin, remMin, awakeMin, unspecifiedMin, inBedMin, napMin}` | `asleepCore/Deep/REM/Unspecified`, `awake`, `inBed` | `light→coreMin`, `deep`, `rem`, `awake_time` |
 | `sleepScore` | 0-100 | — | `daily_sleep.score` |
 | `readinessScore` | 0-100 | — | `daily_readiness.score` |
 | `activityScore` | 0-100 | — | `daily_activity.score` |
@@ -123,7 +126,7 @@
 users/<sub>/meals/<mealId>.jpg        # SSE-KMS, lifecycle: delete after 30 days unless tag pinned=true
 users/<sub>/exports/<ts>.zip          # data export, delete after 7 days
 ```
-Block-public-access on, TLS-only bucket policy, presigned PUT (5 min, `image/jpeg`, ≤ 8 MB) only.
+Block-public-access on, TLS-only bucket policy, presigned PUT (5 min, `image/jpeg`) only. A presigned PUT cannot enforce size, so `aiFn` checks `ContentLength ≤ 8 MB` and the JPEG magic bytes before calling the model (switch to a presigned POST policy if a hard upload cap is needed).
 
 ## 2.5 On-device store (SwiftData, iOS)
 

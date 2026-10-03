@@ -25,7 +25,7 @@ Oura webhooks ─▶ POST /v1/webhooks/oura (public, signature-verified) ─▶ 
 * **Errors**: `{ "error": { "code": "VALIDATION_ERROR", "message": "…", "details": {…} } }` with 400/401/403/404/409/413/422/429/500/502.
 * **Idempotency**: mutating requests accept `Idempotency-Key` header (the client's entity UUID); writes are upserts keyed on client UUIDs.
 * **Versioning**: path prefix `/v1`; additive changes only within a version.
-* **Rate limits**: API Gateway stage throttle 20 rps / burst 40 per user route; AI routes 30 requests/hour/user (DynamoDB counter).
+* **Rate limits**: API Gateway stage/route throttling (20 rps, burst 40; HTTP APIs can't throttle per user), per-user AI limit of 30 requests/hour via a DynamoDB counter (`RATE#ai#…`), and WAF rate-based rules in prod.
 
 ## 3.2 Lambda functions (one per bounded context)
 
@@ -39,6 +39,8 @@ Oura webhooks ─▶ POST /v1/webhooks/oura (public, signature-verified) ─▶ 
 | `syncFn` | `/v1/sync/*` | offline sync |
 | `ouraSyncScheduledFn` | EventBridge `rate(1 hour)` | Oura background pull |
 | `notificationsScheduledFn` | EventBridge `rate(15 minutes)` | reminders & alerts → SNS mobile push (APNs) |
+| `ouraWebhookWorker` | SQS (from `/v1/webhooks/oura`) | fetch changed Oura documents |
+| `tombstonePurge` | EventBridge `rate(1 day)` | backstop for TTL + orphaned-photo cleanup |
 
 ## 3.3 Endpoints
 
@@ -130,7 +132,7 @@ Nutrients are **always computed server-side from the nutrition database × grams
 | POST | `/v1/sync/push` | `{ changes: [{ entityType, id, op: "upsert"|"delete", baseVersion, data }] }` (≤ 100) | `{ results: [{ id, status: "applied"|"conflict", serverVersion, serverItem? }] }` |
 | GET | `/v1/sync/pull` | `since=<cursor>`, `limit≤200` | `{ changes: [{ entityType, id, deleted, version, data }], cursor, hasMore }` |
 
-## 3.6 Offline sync algorithm
+## 3.4 Offline sync algorithm
 
 1. Every local write goes to SwiftData **and** appends a `PendingChange` (outbox) row with the entity snapshot and `baseVersion`.
 2. `SyncEngine` drains the outbox when `NWPathMonitor` reports connectivity, on app foreground, and in a `BGAppRefreshTask`.
@@ -140,10 +142,10 @@ Nutrients are **always computed server-side from the nutrition database × grams
 4. After push, client calls `/sync/pull?since=<cursor>` (cursor = last `GSI1SK` seen) and applies remote changes.
 5. HealthKit-derived data is **not** pushed through the outbox; it is re-derivable and is upserted via `/metrics/daily`, `/body`, `/workouts` in idempotent batches keyed by HealthKit UUID.
 
-## 3.7 Security controls
+## 3.5 Security controls
 
 * JWT authorizer on every non-public route; handlers derive `sub` only from `requestContext.authorizer.jwt.claims.sub`.
-* IAM least privilege per function (e.g. `aiFn` can `bedrock:InvokeModel` + read `users/*/meals/*` in S3; it cannot read tokens).
+* IAM least privilege per function (e.g. `aiFn` can invoke the Claude model on Bedrock — `bedrock:InvokeModel` on the classic runtime; the Mantle Messages endpoint signs for `bedrock-mantle`, so confirm the exact action for your region — + read `users/*/meals/*` in S3; it cannot read tokens).
 * DynamoDB `LeadingKeys` is enforced in code — every key builder takes `sub` and prefixes `USER#`.
 * Oura webhook: HMAC-SHA256 signature check with the client secret + timestamp skew ≤ 5 min.
 * Bedrock prompts contain only the photo and food-level context — no name, email or Apple ID.
