@@ -1,0 +1,163 @@
+# XcodeGen spec — run `xcodegen` in this folder to generate HealthApp.xcodeproj.
+name: HealthApp
+
+options:
+  bundleIdPrefix: com.healthapp
+  deploymentTarget:
+    iOS: "17.0"
+  xcodeVersion: "16.0"
+  createIntermediateGroups: true
+  developmentLanguage: en
+
+configFiles:
+  Debug: Config.xcconfig
+  Release: Config.xcconfig
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0" # Swift 5 language mode (Swift 6 compiler)
+    MARKETING_VERSION: "1.0.0"
+    CURRENT_PROJECT_VERSION: "1"
+    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    DEAD_CODE_STRIPPING: YES
+
+packages:
+  HealthAppKit:
+    path: Packages/HealthAppKit
+
+targets:
+  HealthApp:
+    type: application
+    platform: iOS
+    sources:
+      - path: HealthApp
+        excludes:
+          - "Resources/Info.plist"
+    dependencies:
+      - package: HealthAppKit
+        product: CoreModels
+      - package: HealthAppKit
+        product: DesignSystem
+      - package: HealthAppKit
+        product: Networking
+      - package: HealthAppKit
+        product: AuthKit
+      - package: HealthAppKit
+        product: HealthKitModule
+      - package: HealthAppKit
+        product: OuraModule
+      - package: HealthAppKit
+        product: BodyScaleKit
+      - package: HealthAppKit
+        product: FoodScaleKit
+      - package: HealthAppKit
+        product: NutritionKit
+      - package: HealthAppKit
+        product: FoodRecognitionKit
+      - package: HealthAppKit
+        product: SyncKit
+      - package: HealthAppKit
+        product: AnalyticsKit
+      - package: HealthAppKit
+        product: NotificationsKit
+      - package: HealthAppKit
+        product: MockData
+      - sdk: HealthKit.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.healthapp.ios
+        PRODUCT_NAME: HealthApp
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: $(DEVELOPMENT_TEAM)
+        ENABLE_PREVIEWS: YES
+        SUPPORTS_MACCATALYST: NO
+    info:
+      path: HealthApp/Resources/Info.plist
+      properties:
+        CFBundleDisplayName: HealthApp
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSRequiresIPhoneOS: true
+        UILaunchScreen:
+          UIColorName: LaunchBackground
+        UIApplicationSupportsIndirectInputEvents: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        ITSAppUsesNonExemptEncryption: false
+        # Backend config (from Config.xcconfig). Empty → demo mode.
+        API_BASE_URL: $(API_BASE_URL)
+        COGNITO_DOMAIN: $(COGNITO_DOMAIN)
+        COGNITO_CLIENT_ID: $(COGNITO_CLIENT_ID)
+        COGNITO_REGION: $(COGNITO_REGION)
+        # Privacy usage strings
+        NSHealthShareUsageDescription: HealthApp reads your activity, energy, heart rate, HRV, sleep, workouts and body measurements to show your daily fuel, training and recovery picture.
+        NSHealthUpdateUsageDescription: HealthApp saves the meals, water, weight and body fat you log so they're available in Apple Health.
+        NSCameraUsageDescription: Take photos of meals to estimate what's on your plate, and scan food barcodes.
+        NSPhotoLibraryUsageDescription: Choose meal photos from your library to log food.
+        NSMicrophoneUsageDescription: Describe your meal by voice to log it faster.
+        NSSpeechRecognitionUsageDescription: Your spoken meal description is transcribed into text so the foods can be identified.
+        NSBluetoothAlwaysUsageDescription: Connect to your Bluetooth food scale to log exact portion weights.
+        # Deep links (Cognito callback healthapp://auth/callback, Oura healthapp://oura/connected)
+        CFBundleURLTypes:
+          - CFBundleURLName: com.healthapp.ios
+            CFBundleURLSchemes:
+              - healthapp
+        BGTaskSchedulerPermittedIdentifiers:
+          - com.healthapp.ios.refresh
+          - com.healthapp.ios.sync-processing
+        UIBackgroundModes:
+          - fetch
+          - processing
+          - remote-notification
+    entitlements:
+      path: HealthApp/Resources/HealthApp.entitlements
+      properties:
+        com.apple.developer.healthkit: true
+        com.apple.developer.healthkit.access: [] # clinical health records OFF
+        com.apple.developer.healthkit.background-delivery: true
+        com.apple.developer.applesignin:
+          - Default
+        aps-environment: development
+        com.apple.developer.default-data-protection: NSFileProtectionComplete
+        # Optional — enable when you host apple-app-site-association for universal links:
+        # com.apple.developer.associated-domains:
+        #   - applinks:app.example.com
+
+  HealthAppTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: HealthAppTests
+    dependencies:
+      - target: HealthApp
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.healthapp.ios.tests
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/HealthApp.app/HealthApp
+        BUNDLE_LOADER: $(TEST_HOST)
+
+schemes:
+  HealthApp:
+    build:
+      targets:
+        HealthApp: all
+        HealthAppTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      gatherCoverageData: true
+      targets:
+        - HealthAppTests
+    archive:
+      config: Release

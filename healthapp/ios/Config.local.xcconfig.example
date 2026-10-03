@@ -1,0 +1,6 @@
+// Copy to Config.local.xcconfig (git-ignored) and fill in.
+API_BASE_URL = https:/$()/abc123.execute-api.eu-west-1.amazonaws.com
+COGNITO_DOMAIN = healthapp-dev.auth.eu-west-1.amazoncognito.com
+COGNITO_CLIENT_ID = 1a2b3c4d5e6f7g8h9i0j
+COGNITO_REGION = eu-west-1
+DEVELOPMENT_TEAM = ABCDE12345

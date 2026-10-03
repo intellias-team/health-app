@@ -1,0 +1,20 @@
+// HealthApp build configuration.
+//
+// Leave the backend values EMPTY to run in demo mode (90 days of generated data, no network).
+// Put real values in Config.local.xcconfig (git-ignored), which is included at the bottom.
+//
+// IMPORTANT: "//" starts a comment in .xcconfig files, so write URLs as  https:/$()/your-host/stage
+// e.g.  API_BASE_URL = https:/$()/abc123.execute-api.eu-west-1.amazonaws.com
+//
+// API_BASE_URL       API Gateway HTTP API base URL (the app appends /v1/...)
+// COGNITO_DOMAIN     Hosted UI domain, e.g. healthapp-dev.auth.eu-west-1.amazoncognito.com (or just the prefix)
+// COGNITO_CLIENT_ID  User-pool app client id (public client, no secret, PKCE)
+// COGNITO_REGION     e.g. eu-west-1
+
+API_BASE_URL =
+COGNITO_DOMAIN =
+COGNITO_CLIENT_ID =
+COGNITO_REGION =
+DEVELOPMENT_TEAM =
+
+#include? "Config.local.xcconfig"
