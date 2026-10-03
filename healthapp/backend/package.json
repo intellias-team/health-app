@@ -10,8 +10,13 @@
   "scripts": {
     "test": "node --test \"test/**/*.test.js\"",
     "test:watch": "node --test --watch \"test/**/*.test.js\"",
+    "validate": "sam validate --lint",
     "build": "sam build",
-    "deploy": "sam deploy --guided"
+    "deploy": "sam build && sam deploy",
+    "deploy:prod": "sam build --config-env prod && sam deploy --config-env prod",
+    "smoke": "node scripts/smoke-test.mjs",
+    "smoke:prod": "node scripts/smoke-test.mjs --stage prod",
+    "logs": "sam logs --stack-name healthapp-dev"
   },
   "dependencies": {
     "@anthropic-ai/bedrock-sdk": "^0.34.2",
@@ -21,7 +26,13 @@
     "@aws-sdk/client-secrets-manager": "^3.1146.0",
     "@aws-sdk/client-sns": "^3.1146.0",
     "@aws-sdk/client-sqs": "^3.1146.0",
+    "@aws-sdk/client-ssm": "^3.1146.0",
     "@aws-sdk/lib-dynamodb": "^3.1146.0",
-    "@aws-sdk/s3-request-presigner": "^3.1146.0"
+    "@aws-sdk/s3-request-presigner": "^3.1146.0",
+    "esbuild": "^0.25.12"
+  },
+  "devDependencies": {
+    "@aws-sdk/client-cloudformation": "^3.1146.0",
+    "@aws-sdk/client-cognito-identity-provider": "^3.1146.0"
   }
 }

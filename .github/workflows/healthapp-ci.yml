@@ -26,6 +26,7 @@ jobs:
         with:
           use-installer: true
       - run: sam validate --lint --template template.yaml
+      - run: sam build
 
   ios:
     runs-on: macos-15

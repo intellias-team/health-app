@@ -21,20 +21,29 @@ Parameters:
   CognitoDomainPrefix:
     Type: String
     Default: healthapp
-    Description: Hosted UI domain prefix; the stage is appended (must be globally unique per region).
+    Description: Hosted UI domain prefix; '-<stage>-<accountId>' is appended so it is unique per region.
   AppleServicesId:
     Type: String
-    Description: Apple Services ID (e.g. com.example.healthapp.signin) used as the client_id.
+    Default: ""
+    Description: Apple Services ID (e.g. com.example.healthapp.signin) used as the client_id. Leave empty to deploy without Sign in with Apple (test users only).
   AppleTeamId:
     Type: String
+    Default: ""
     Description: Apple Developer Team ID.
   AppleKeyId:
     Type: String
+    Default: ""
     Description: Key ID of the Sign in with Apple private key.
   ApplePrivateKey:
     Type: String
+    Default: ""
     NoEcho: true
     Description: Contents of the .p8 Sign in with Apple private key.
+  CloudFrontPriceClass:
+    Type: String
+    Default: PriceClass_100
+    AllowedValues: [PriceClass_100, PriceClass_200, PriceClass_All]
+    Description: Edge locations used by the API distribution (PriceClass_100 = North America + Europe).
   ApnsPlatformApplicationArn:
     Type: String
     Default: ""
@@ -50,6 +59,9 @@ Conditions:
   IsProd: !Equals [!Ref Stage, prod]
   HasPush: !Not [!Equals [!Ref ApnsPlatformApplicationArn, ""]]
   HasBedrockRegion: !Not [!Equals [!Ref BedrockRegion, ""]]
+  HasApple: !Not [!Equals [!Ref AppleServicesId, ""]]
+  # Password test users are allowed in dev, and in prod only until Apple sign-in is configured.
+  AllowTestUsers: !Or [!Not [!Condition IsProd], !Not [!Condition HasApple]]
 
 Globals:
   Function:
@@ -73,6 +85,9 @@ Globals:
         BEDROCK_MODEL_ID: !Ref BedrockModelId
         BEDROCK_REGION: !If [HasBedrockRegion, !Ref BedrockRegion, !Ref AWS::Region]
         APP_SCHEME: !Ref AppScheme
+        # Shared secret CloudFront adds as x-origin-verify; requests without it get 403.
+        ORIGIN_VERIFY_SECRET: !Sub "{{resolve:secretsmanager:${OriginVerifySecret}:SecretString:value}}"
+        PUBLIC_BASE_URL_PARAM: !Sub /healthapp/${Stage}/public-base-url
         NODE_OPTIONS: --enable-source-maps
         LOG_LEVEL: info
 
@@ -254,6 +269,7 @@ Resources:
 
   AppleIdentityProvider:
     Type: AWS::Cognito::UserPoolIdentityProvider
+    Condition: HasApple
     Properties:
       UserPoolId: !Ref UserPool
       ProviderName: SignInWithApple
@@ -272,11 +288,10 @@ Resources:
     Type: AWS::Cognito::UserPoolDomain
     Properties:
       UserPoolId: !Ref UserPool
-      Domain: !Sub ${CognitoDomainPrefix}-${Stage}
+      Domain: !Sub ${CognitoDomainPrefix}-${Stage}-${AWS::AccountId}
 
   UserPoolClient:
     Type: AWS::Cognito::UserPoolClient
-    DependsOn: AppleIdentityProvider
     Properties:
       UserPoolId: !Ref UserPool
       ClientName: !Sub healthapp-ios-${Stage}
@@ -286,8 +301,15 @@ Resources:
       AllowedOAuthScopes: [openid, email, profile]
       CallbackURLs: [healthapp://auth/callback]
       LogoutURLs: [healthapp://auth/signout]
-      SupportedIdentityProviders: [SignInWithApple]
-      ExplicitAuthFlows: [ALLOW_REFRESH_TOKEN_AUTH]
+      SupportedIdentityProviders: !If
+        - HasApple
+        - !If [AllowTestUsers, [!Ref AppleIdentityProvider, COGNITO], [!Ref AppleIdentityProvider]]
+        - [COGNITO]
+      # Test users (created by an admin; there is no self sign-up) sign in with USER_PASSWORD_AUTH.
+      ExplicitAuthFlows: !If
+        - AllowTestUsers
+        - [ALLOW_REFRESH_TOKEN_AUTH, ALLOW_USER_PASSWORD_AUTH, ALLOW_USER_SRP_AUTH]
+        - [ALLOW_REFRESH_TOKEN_AUTH]
       PreventUserExistenceErrors: ENABLED
       EnableTokenRevocation: true
       AccessTokenValidity: 60
@@ -306,6 +328,17 @@ Resources:
         SecretStringTemplate: '{"clientId":"REPLACE_ME","clientSecret":"REPLACE_ME"}'
         GenerateStringKey: webhookVerificationToken
         PasswordLength: 40
+        ExcludePunctuation: true
+
+  OriginVerifySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub healthapp/${Stage}/origin-verify
+      Description: Header value CloudFront sends to the API so direct execute-api calls can be refused
+      GenerateSecretString:
+        SecretStringTemplate: "{}"
+        GenerateStringKey: value
+        PasswordLength: 48
         ExcludePunctuation: true
 
   UsdaSecret:
@@ -376,9 +409,17 @@ Resources:
   # ── Functions ──────────────────────────────────────────────────────────────────────────────
   ProfileFn:
     Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints: [src/handlers/profile.js]
+        Format: cjs
+        Platform: node
+        Target: node22
+        Sourcemap: true
     Properties:
       FunctionName: !Sub healthapp-${Stage}-profile
-      Handler: src/handlers/profile.handler
+      Handler: profile.handler
       Timeout: 60
       Policies:
         - Statement:
@@ -407,6 +448,7 @@ Resources:
                   - !Sub "arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:endpoint/*"
               - !Ref AWS::NoValue
       Events:
+        Health: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: /v1/health, Auth: { Authorizer: NONE } } }
         GetMe: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: /v1/me } }
         PutMe: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: PUT, Path: /v1/me } }
         DeleteMe: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: DELETE, Path: /v1/me } }
@@ -418,9 +460,17 @@ Resources:
 
   NutritionFn:
     Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints: [src/handlers/nutrition.js]
+        Format: cjs
+        Platform: node
+        Target: node22
+        Sourcemap: true
     Properties:
       FunctionName: !Sub healthapp-${Stage}-nutrition
-      Handler: src/handlers/nutrition.handler
+      Handler: nutrition.handler
       Policies:
         - Statement:
             - Effect: Allow
@@ -453,9 +503,17 @@ Resources:
 
   HealthFn:
     Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints: [src/handlers/health.js]
+        Format: cjs
+        Platform: node
+        Target: node22
+        Sourcemap: true
     Properties:
       FunctionName: !Sub healthapp-${Stage}-health
-      Handler: src/handlers/health.handler
+      Handler: health.handler
       MemorySize: 1024
       Policies:
         - Statement:
@@ -477,9 +535,17 @@ Resources:
 
   AiFn:
     Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints: [src/handlers/ai.js]
+        Format: cjs
+        Platform: node
+        Target: node22
+        Sourcemap: true
     Properties:
       FunctionName: !Sub healthapp-${Stage}-ai
-      Handler: src/handlers/ai.handler
+      Handler: ai.handler
       MemorySize: 1024
       Timeout: 29 # HTTP API integration limit
       Policies:
@@ -519,9 +585,17 @@ Resources:
 
   OuraFn:
     Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints: [src/handlers/oura.js]
+        Format: cjs
+        Platform: node
+        Target: node22
+        Sourcemap: true
     Properties:
       FunctionName: !Sub healthapp-${Stage}-oura
-      Handler: src/handlers/oura.handler
+      Handler: oura.handler
       Policies:
         - Statement:
             - Effect: Allow
@@ -536,6 +610,9 @@ Resources:
             - Effect: Allow
               Action: sqs:SendMessage
               Resource: !GetAtt OuraWebhookQueue.Arn
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/healthapp/${Stage}/public-base-url"
       Events:
         Authorize: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: /v1/integrations/oura/authorize } }
         Callback: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: /v1/integrations/oura/callback, Auth: { Authorizer: NONE } } }
@@ -546,9 +623,17 @@ Resources:
 
   SyncFn:
     Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints: [src/handlers/sync.js]
+        Format: cjs
+        Platform: node
+        Target: node22
+        Sourcemap: true
     Properties:
       FunctionName: !Sub healthapp-${Stage}-sync
-      Handler: src/handlers/sync.handler
+      Handler: sync.handler
       Policies:
         - Statement:
             - Effect: Allow
@@ -560,9 +645,17 @@ Resources:
 
   OuraSyncScheduledFn:
     Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints: [src/handlers/ouraSyncScheduled.js]
+        Format: cjs
+        Platform: node
+        Target: node22
+        Sourcemap: true
     Properties:
       FunctionName: !Sub healthapp-${Stage}-oura-sync-scheduled
-      Handler: src/handlers/ouraSyncScheduled.handler
+      Handler: ouraSyncScheduled.handler
       Timeout: 900
       Policies:
         - Statement:
@@ -584,9 +677,17 @@ Resources:
 
   OuraWebhookWorkerFn:
     Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints: [src/handlers/ouraWebhookWorker.js]
+        Format: cjs
+        Platform: node
+        Target: node22
+        Sourcemap: true
     Properties:
       FunctionName: !Sub healthapp-${Stage}-oura-webhook-worker
-      Handler: src/handlers/ouraWebhookWorker.handler
+      Handler: ouraWebhookWorker.handler
       Timeout: 60
       Policies:
         - Statement:
@@ -610,9 +711,17 @@ Resources:
 
   NotificationsScheduledFn:
     Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints: [src/handlers/notificationsScheduled.js]
+        Format: cjs
+        Platform: node
+        Target: node22
+        Sourcemap: true
     Properties:
       FunctionName: !Sub healthapp-${Stage}-notifications-scheduled
-      Handler: src/handlers/notificationsScheduled.handler
+      Handler: notificationsScheduled.handler
       Timeout: 600
       Policies:
         - Statement:
@@ -634,9 +743,17 @@ Resources:
 
   TombstonePurgeFn:
     Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints: [src/handlers/tombstonePurge.js]
+        Format: cjs
+        Platform: node
+        Target: node22
+        Sourcemap: true
     Properties:
       FunctionName: !Sub healthapp-${Stage}-tombstone-purge
-      Handler: src/handlers/tombstonePurge.handler
+      Handler: tombstonePurge.handler
       Timeout: 900
       Policies:
         - Statement:
@@ -679,8 +796,84 @@ Resources:
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
 
+  # ── CloudFront (public entry point until a custom domain is chosen) ──────────────────────────
+  # Caching is effectively off (TTL 0; every API response is `cache-control: no-store`).
+  # Authorization must be part of the cache policy for CloudFront to forward it to the origin.
+  ApiCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub healthapp-${Stage}-api-no-cache
+        DefaultTTL: 0
+        MinTTL: 0
+        MaxTTL: 1
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+          HeadersConfig:
+            HeaderBehavior: whitelist
+            Headers: [Authorization]
+          CookiesConfig: { CookieBehavior: none }
+          QueryStringsConfig: { QueryStringBehavior: all }
+
+  ApiOriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub healthapp-${Stage}-api-origin
+        # Host is NOT forwarded: API Gateway must see its own execute-api host name.
+        HeadersConfig:
+          HeaderBehavior: whitelist
+          Headers: [Accept, Content-Type, Idempotency-Key, User-Agent, X-Oura-Signature, X-Oura-Timestamp]
+        CookiesConfig: { CookieBehavior: none }
+        QueryStringsConfig: { QueryStringBehavior: all }
+
+  ApiDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub HealthApp ${Stage} API
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: !Ref CloudFrontPriceClass
+        Origins:
+          - Id: HttpApiOrigin
+            DomainName: !Sub ${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+              OriginReadTimeout: 30
+            OriginCustomHeaders:
+              - HeaderName: x-origin-verify
+                HeaderValue: !Sub "{{resolve:secretsmanager:${OriginVerifySecret}:SecretString:value}}"
+        DefaultCacheBehavior:
+          TargetOriginId: HttpApiOrigin
+          ViewerProtocolPolicy: https-only
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: !Ref ApiCachePolicy
+          OriginRequestPolicyId: !Ref ApiOriginRequestPolicy
+          # Managed "SecurityHeadersPolicy" (HSTS, nosniff, frame-options, referrer-policy).
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03
+
+  PublicBaseUrlParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /healthapp/${Stage}/public-base-url
+      Type: String
+      Value: !Sub https://${ApiDistribution.DomainName}
+      Description: Public API base URL (CloudFront). Read by functions that build absolute URLs.
+
 Outputs:
+  ApiBaseUrl:
+    Description: Public API base URL — use this in the app and for all clients
+    Value: !Sub https://${ApiDistribution.DomainName}/v1
+  CloudFrontDistributionId:
+    Value: !Ref ApiDistribution
   ApiUrl:
+    Description: Raw API Gateway endpoint (refuses requests that don't come through CloudFront)
     Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}
   UserPoolId:
     Value: !Ref UserPool
@@ -693,9 +886,9 @@ Outputs:
     Value: !Sub https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/idpresponse
   OuraRedirectUri:
     Description: Register this as the Oura app redirect URI
-    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/v1/integrations/oura/callback
+    Value: !Sub https://${ApiDistribution.DomainName}/v1/integrations/oura/callback
   OuraWebhookUrl:
-    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/v1/webhooks/oura
+    Value: !Sub https://${ApiDistribution.DomainName}/v1/webhooks/oura
   BucketName:
     Value: !Ref MediaBucket
   DataTableName:

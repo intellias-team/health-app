@@ -27,7 +27,9 @@
 | Schedules | `AWS::Scheduler::Schedule` ×3 | with dedicated invoke role, flexible window off |
 | `OuraSecret`, `FdcApiKeySecret`, `AppleSignInKeySecret`, `ApnsSecret` | `AWS::SecretsManager::Secret` | Oura `{client_id, client_secret, webhook_verification_token}`, USDA FDC key, Apple `.p8` for Cognito IdP, APNs auth key/cert for SNS |
 | `ApnsPlatformApplication` | SNS platform application (`APNS` / `APNS_SANDBOX` per stage) | Created by custom resource or one-off script (CloudFormation lacks a native type — verify); endpoints created per `DEVICE#` |
-| `ApiWebAcl` (prod) | `AWS::WAFv2::WebACL` + association | AWS managed rule groups: Common, KnownBadInputs, IpReputation, rate-based rule 2,000 req/5 min/IP |
+| `ApiDistribution` + `ApiCachePolicy` + `ApiOriginRequestPolicy` | `AWS::CloudFront::Distribution` | Public entry point on the default `*.cloudfront.net` domain until a custom domain is chosen. TTL 0, `Authorization` forwarded via the cache policy, Host not forwarded, managed security-headers policy, adds the `x-origin-verify` header from `OriginVerifySecret` |
+| `PublicBaseUrlParam` | `AWS::SSM::Parameter` | `/healthapp/<stage>/public-base-url` = the distribution URL; read by `ouraFn` to build the Oura redirect |
+| `ApiWebAcl` (optional) | `AWS::WAFv2::WebACL` (scope CLOUDFRONT, us-east-1) | AWS managed rule groups: Common, KnownBadInputs, IpReputation, rate-based rule 2,000 req/5 min/IP. Not in the template yet |
 | Log groups | `AWS::Logs::LogGroup` per function | 30-day retention, KMS-encrypted |
 | Alarms + `AlarmTopic` | `AWS::CloudWatch::Alarm`, SNS topic | see §11.6 |
 

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as keys from "../src/lib/keys.js";
-import { ApiError, compilePath, createRouter, json } from "../src/lib/http.js";
+import { ApiError, compilePath, createRouter, isFromTrustedOrigin, json } from "../src/lib/http.js";
 import { silentLogger, hashSub, createLogger } from "../src/lib/logger.js";
 import { apiEvent, parse, SUB } from "./helpers/fakes.js";
 
@@ -88,4 +88,16 @@ test("logger never writes bodies and hashes subs", () => {
   assert.equal(lines[0].sub, undefined);
   assert.equal(lines[0].subHash.length, 16);
   assert.notEqual(lines[0].subHash, SUB);
+});
+
+test("router rejects requests that bypass CloudFront when an origin secret is set", async () => {
+  const route = createRouter(
+    [{ method: "GET", path: "/v1/health", public: true, handler: async () => json(200, { ok: true }) }],
+    { logger: silentLogger, originSecret: "s3cret-value" },
+  );
+  assert.equal((await route(apiEvent({ path: "/v1/health", sub: null }))).statusCode, 403);
+  assert.equal((await route(apiEvent({ path: "/v1/health", sub: null, headers: { "x-origin-verify": "wrong-value!" } }))).statusCode, 403);
+  const ok = parse(await route(apiEvent({ path: "/v1/health", sub: null, headers: { "X-Origin-Verify": "s3cret-value" } })));
+  assert.equal(ok.status, 200);
+  assert.equal(isFromTrustedOrigin({}, undefined), true, "no secret configured → check disabled");
 });

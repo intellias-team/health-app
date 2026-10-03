@@ -6,7 +6,7 @@
 ## 3.1 Topology
 
 ```
-iOS app ──HTTPS──▶ API Gateway (HTTP API, /v1) ──JWT authorizer (Cognito User Pool)──▶ Lambda (Node.js 22, arm64)
+iOS app ──HTTPS──▶ CloudFront (*.cloudfront.net until a domain is chosen; no caching) ──x-origin-verify──▶ API Gateway (HTTP API, /v1) ──JWT authorizer (Cognito User Pool)──▶ Lambda (Node.js 22, arm64)
                                                                                       │
              ┌────────────────────────────────────────────────────────────────────────┼──────────────────────┐
              ▼                    ▼                     ▼                    ▼          ▼                      ▼
@@ -21,11 +21,12 @@ Oura webhooks ─▶ POST /v1/webhooks/oura (public, signature-verified) ─▶ 
   (`/oauth2/authorize?identity_provider=SignInWithApple`, PKCE) via `ASWebAuthenticationSession`, receives
   `id_token`/`access_token`/`refresh_token`, stores them in the Keychain. API Gateway validates the **access token**
   (`aud` = app client id). `sub` from the JWT is the only user identifier the backend trusts.
+* **Base URL**: `https://<distribution>.cloudfront.net/v1` (stack output `ApiBaseUrl`). The raw execute-api URL refuses requests without CloudFront's `x-origin-verify` header (403).
 * **Transport**: TLS 1.2+, JSON bodies, `Content-Type: application/json`, ISO-8601 UTC timestamps, dates as `yyyy-mm-dd` in the user's timezone.
 * **Errors**: `{ "error": { "code": "VALIDATION_ERROR", "message": "…", "details": {…} } }` with 400/401/403/404/409/413/422/429/500/502.
 * **Idempotency**: mutating requests accept `Idempotency-Key` header (the client's entity UUID); writes are upserts keyed on client UUIDs.
 * **Versioning**: path prefix `/v1`; additive changes only within a version.
-* **Rate limits**: API Gateway stage/route throttling (20 rps, burst 40; HTTP APIs can't throttle per user), per-user AI limit of 30 requests/hour via a DynamoDB counter (`RATE#ai#…`), and (prod) CloudFront + WAF rate-based rules in front of the API — AWS WAF cannot attach to an HTTP API directly.
+* **Rate limits**: API Gateway stage/route throttling (20 rps, burst 40; HTTP APIs can't throttle per user), per-user AI limit of 30 requests/hour via a DynamoDB counter (`RATE#ai#…`), and optional WAF rate-based rules on the CloudFront distribution (AWS WAF cannot attach to an HTTP API directly).
 
 ## 3.2 Lambda functions (one per bounded context)
 
@@ -49,6 +50,7 @@ All routes require `Authorization: Bearer <Cognito access token>` unless marked 
 ### Profile, goals, permissions
 | Method | Path | Body / Query | Response |
 |---|---|---|---|
+| GET | `/v1/health` **public** | — | `{ status: "ok", stage, time }` |
 | GET | `/v1/me` | — | `{ profile, goals, connections[] }` |
 | PUT | `/v1/me` | `Profile` (partial) | `{ profile }` |
 | PUT | `/v1/me/goals` | `Goals` | `{ goals }` |
@@ -150,4 +152,4 @@ Nutrients are **always computed server-side from the nutrition database × grams
 * Oura webhook: HMAC-SHA256 signature check with the client secret + timestamp skew ≤ 5 min.
 * Bedrock prompts contain only the photo and food-level context — no name, email or Apple ID.
 * CloudWatch logs scrub bodies (structured logger logs route, status, latency, `sub` hash only). 30-day log retention.
-* WAF (prod) via CloudFront in front of the HTTP API, with AWS managed rule groups.
+* CloudFront is the only entry point: it adds a secret `x-origin-verify` header (Secrets Manager `healthapp/<stage>/origin-verify`) and the router returns 403 without it. WAF (AWS managed rule groups) can be attached to the distribution.

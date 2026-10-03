@@ -1,0 +1,56 @@
+# SAM CLI config. deploy/sync/logs use the "qbiz" AWS CLI profile and its region (add
+# region = "us-east-1" next to each profile line to pin one). build/validate need no credentials.
+#   dev:  sam build && sam deploy
+#   prod: sam build && sam deploy --config-env prod
+version = 0.1
+
+[default.global.parameters]
+stack_name = "healthapp-dev"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.validate.parameters]
+lint = true
+
+[default.deploy.parameters]
+profile = "qbiz"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+fail_on_empty_changeset = false
+resolve_s3 = true
+s3_prefix = "healthapp-dev"
+parameter_overrides = "Stage=\"dev\""
+tags = "app=\"healthapp\" stage=\"dev\""
+
+[default.sync.parameters]
+profile = "qbiz"
+watch = true
+
+[default.logs.parameters]
+profile = "qbiz"
+tail = true
+
+[prod.global.parameters]
+stack_name = "healthapp-prod"
+
+[prod.build.parameters]
+cached = true
+parallel = true
+
+[prod.deploy.parameters]
+profile = "qbiz"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+fail_on_empty_changeset = false
+resolve_s3 = true
+s3_prefix = "healthapp-prod"
+parameter_overrides = "Stage=\"prod\""
+tags = "app=\"healthapp\" stage=\"prod\""
+
+[default.delete.parameters]
+profile = "qbiz"
+
+[prod.delete.parameters]
+profile = "qbiz"

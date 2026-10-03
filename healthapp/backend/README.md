@@ -5,7 +5,8 @@ Serverless backend for the HealthApp iPhone app. Contracts:
 [`docs/03-api-architecture.md`](../docs/03-api-architecture.md).
 
 ```
-Cognito (Sign in with Apple) ─▶ HTTP API (JWT authorizer) ─▶ Lambda (Node.js 22, ESM, arm64)
+Client ─▶ CloudFront (https://<id>.cloudfront.net, no caching) ─▶ HTTP API (JWT authorizer) ─▶ Lambda (Node.js 22, arm64)
+Cognito (Sign in with Apple, or admin-created test users until Apple is configured)
   DynamoDB (HealthAppData, HealthAppFoodCatalog) · S3 media (SSE-KMS) · KMS (data + token keys)
   Secrets Manager (Oura, USDA) · SQS (Oura webhooks + DLQ) · EventBridge Scheduler · SNS → APNs
   Claude on Amazon Bedrock (Mantle Messages endpoint via @anthropic-ai/bedrock-sdk)
@@ -23,22 +24,77 @@ Cognito (Sign in with Apple) ─▶ HTTP API (JWT authorizer) ─▶ Lambda (Nod
 | `test/` | `node:test` unit tests with an in-memory DynamoDB fake, fake fetch, fake Claude |
 
 AWS and Anthropic SDKs are imported lazily inside factory functions, so every pure module and every
-handler (with injected fakes) runs without `node_modules`.
+handler (with injected fakes) runs without `node_modules`. `sam build` bundles each function with
+esbuild (about 1 MB of code per function, all SDKs included).
+
+## Deploy to the `qbiz` AWS profile
+
+`samconfig.toml` targets the `qbiz` AWS CLI profile and its configured region. Stacks are
+`healthapp-dev` (default) and `healthapp-prod` (`--config-env prod`).
+
+```powershell
+# Windows PowerShell or any shell, from healthapp/backend
+aws sts get-caller-identity --profile qbiz     # confirm the profile works
+npm ci
+npm test
+npm run deploy                                 # sam build && sam deploy (shows the change set; confirm with y)
+npm run smoke                                  # end-to-end checks through CloudFront
+```
+
+The first deploy takes 5–15 minutes, most of it for the CloudFront distribution.
+
+**Public endpoint.** Until a domain is chosen, the API is served from the CloudFront default domain.
+The `ApiBaseUrl` stack output (e.g. `https://d1234abcd.cloudfront.net/v1`) is what the iOS app and
+other clients use. Get it with:
+
+```powershell
+aws cloudformation describe-stacks --stack-name healthapp-dev --profile qbiz `
+  --query "Stacks[0].Outputs[?OutputKey=='ApiBaseUrl'].OutputValue" --output text
+```
+
+CloudFront adds a secret `x-origin-verify` header (generated in Secrets Manager as
+`healthapp/<stage>/origin-verify`). Requests sent straight to the execute-api URL get 403, so CloudFront
+is the only way in. Nothing is cached: every response is `cache-control: no-store` and the cache
+policy has a TTL of 0.
+
+**Sign-in before Apple is set up.** The Apple parameters are optional. When they're empty, the user pool
+accepts only admin-created users with a password (there is no self sign-up). `npm run smoke` creates a
+`smoketest` user and resets its password on every run. To make your own test user:
+
+```powershell
+$pool = aws cloudformation describe-stacks --stack-name healthapp-dev --profile qbiz `
+  --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'].OutputValue" --output text
+aws cognito-idp admin-create-user --user-pool-id $pool --username me --message-action SUPPRESS --profile qbiz
+aws cognito-idp admin-set-user-password --user-pool-id $pool --username me --password "<strong password>" --permanent --profile qbiz
+```
+
+Then get a token with `aws cognito-idp initiate-auth --auth-flow USER_PASSWORD_AUTH --client-id <ClientId>
+--auth-parameters USERNAME=me,PASSWORD=<password> --profile qbiz` and send
+`Authorization: Bearer <AccessToken>`. Password sign-in stays on in `dev`; in `prod` it turns off as soon
+as the Apple parameters are set.
+
+**Adding a custom domain later.** Request an ACM certificate in **us-east-1**, add `Aliases` and
+`ViewerCertificate` to `ApiDistribution`, point DNS at the distribution, and redeploy. The Oura redirect
+URL is read from the `/healthapp/<stage>/public-base-url` SSM parameter, so update that parameter's value
+in the template (and re-register the URL with Oura).
+
+**Tear down.** Run `sam delete --stack-name healthapp-dev --profile qbiz`. The KMS keys, DynamoDB tables and
+media bucket have `DeletionPolicy: Retain`, so remove them by hand if you really want the data gone.
 
 ## Prerequisites
 
 - Node.js 22, npm
-- AWS SAM CLI ≥ 1.120 and credentials for the target account
-- Apple Developer account (Sign in with Apple), Oura developer app, USDA FoodData Central API key
+- AWS CLI v2 with the `qbiz` profile configured (`aws configure --profile qbiz` or SSO), and AWS SAM CLI ≥ 1.120
+- Later (optional for the first deploy): Apple Developer account (Sign in with Apple), Oura developer app, USDA FoodData Central API key
 - Amazon Bedrock access to the Claude model in your region
 - Optional: an SNS platform application for APNs (token-based `.p8` auth)
 
-## Deploy
+## Deploy (other accounts)
 
 ```bash
 npm ci
 sam build
-sam deploy --guided            # first time; answers are saved to samconfig.toml
+sam deploy --guided --profile <profile>   # or edit samconfig.toml
 ```
 
 ### Parameters
@@ -48,9 +104,10 @@ sam deploy --guided            # first time; answers are saved to samconfig.toml
 | `Stage` | `dev` | `dev` or `prod`. `prod` turns on DynamoDB/Cognito deletion protection |
 | `BedrockModelId` | `anthropic.claude-opus-5-5` | Model id on the Bedrock Mantle endpoint |
 | `BedrockRegion` | *(stack region)* | Region to call Bedrock in |
-| `CognitoDomainPrefix` | `healthapp` | Hosted UI domain is `<prefix>-<stage>.auth.<region>.amazoncognito.com` |
-| `AppleServicesId` / `AppleTeamId` / `AppleKeyId` | — | Sign in with Apple configuration |
-| `ApplePrivateKey` | — | `NoEcho`; contents of the `.p8` key |
+| `CognitoDomainPrefix` | `healthapp` | Hosted UI domain is `<prefix>-<stage>-<accountId>.auth.<region>.amazoncognito.com` |
+| `AppleServicesId` / `AppleTeamId` / `AppleKeyId` | *(empty)* | Sign in with Apple configuration. Empty = test users only |
+| `ApplePrivateKey` | *(empty)* | `NoEcho`; contents of the `.p8` key |
+| `CloudFrontPriceClass` | `PriceClass_100` | Edge locations for the API distribution |
 | `ApnsPlatformApplicationArn` | *(empty)* | Leave empty to disable push |
 | `AppScheme` | `healthapp` | Used for OAuth redirects back into the app |
 | `LogRetentionDays` | `30` | CloudWatch log retention |
@@ -58,10 +115,10 @@ sam deploy --guided            # first time; answers are saved to samconfig.toml
 After the first deploy, fill in the two secrets (outputs `OuraSecretArn`, `UsdaSecretArn`):
 
 ```bash
-aws secretsmanager put-secret-value --secret-id healthapp/dev/usda-fdc --secret-string '{"apiKey":"<FDC key>"}'
+aws secretsmanager put-secret-value --profile qbiz --secret-id healthapp/dev/usda-fdc --secret-string '{"apiKey":"<FDC key>"}'
 # keep the generated webhookVerificationToken when updating the Oura secret:
-aws secretsmanager get-secret-value --secret-id healthapp/dev/oura --query SecretString --output text
-aws secretsmanager put-secret-value --secret-id healthapp/dev/oura \
+aws secretsmanager get-secret-value --profile qbiz --secret-id healthapp/dev/oura --query SecretString --output text
+aws secretsmanager put-secret-value --profile qbiz --secret-id healthapp/dev/oura \
   --secret-string '{"clientId":"…","clientSecret":"…","webhookVerificationToken":"<generated value>"}'
 ```
 
@@ -70,8 +127,8 @@ aws secretsmanager put-secret-value --secret-id healthapp/dev/oura \
 1. **App ID** — in Certificates, Identifiers & Profiles enable *Sign in with Apple* on the app's App ID.
 2. **Services ID** — create one (e.g. `com.example.healthapp.signin`); this is `AppleServicesId`.
    Configure *Sign in with Apple* on it with:
-   - Domain: `<CognitoDomainPrefix>-<Stage>.auth.<region>.amazoncognito.com`
-   - Return URL: `https://<CognitoDomainPrefix>-<Stage>.auth.<region>.amazoncognito.com/oauth2/idpresponse`
+   - Domain: `<CognitoDomainPrefix>-<Stage>-<accountId>.auth.<region>.amazoncognito.com`
+   - Return URL: `https://<CognitoDomainPrefix>-<Stage>-<accountId>.auth.<region>.amazoncognito.com/oauth2/idpresponse`
      (also printed as the `AppleReturnUrl` output)
 3. **Key** — create a key with *Sign in with Apple* enabled, download the `.p8` (→ `ApplePrivateKey`) and
    note its Key ID (→ `AppleKeyId`). Your Team ID is `AppleTeamId`.
@@ -83,11 +140,11 @@ aws secretsmanager put-secret-value --secret-id healthapp/dev/oura \
 ## Oura app registration
 
 1. Create an application at <https://cloud.ouraring.com/oauth/applications>.
-2. Redirect URI: `https://<api>/v1/integrations/oura/callback` (output `OuraRedirectUri`; if you put a custom
-   domain in front of the API, set `OURA_REDIRECT_URI` on the Oura function to the public URL).
+2. Redirect URI: `https://<cloudfront-domain>/v1/integrations/oura/callback` (output `OuraRedirectUri`). The
+   function reads the public base URL from SSM, so the redirect it sends to Oura matches automatically.
 3. Put the client id/secret into the Oura secret (above).
 4. Webhooks: create subscriptions (one per `event_type` × `data_type` you want — `daily_sleep`, `daily_readiness`,
-   `daily_activity`, `sleep`, `workout`, `daily_spo2`) with callback `https://<api>/v1/webhooks/oura` and the
+   `daily_activity`, `sleep`, `workout`, `daily_spo2`) with callback `https://<cloudfront-domain>/v1/webhooks/oura` (output `OuraWebhookUrl`) and the
    secret's `webhookVerificationToken`. `createWebhookSubscription()` in `src/services/oura.js` does this:
 
    ```bash
@@ -160,8 +217,8 @@ in-memory DynamoDB fake, fake fetch, fake Claude client and fake media store.
 
 ## Known limitations / deviations
 
-- WAF: AWS WAF cannot be attached to API Gateway **HTTP** APIs; put CloudFront (with WAF) in front of the API
-  for prod if WAF is required.
+- WAF: AWS WAF can't attach to API Gateway **HTTP** APIs, but the API is now behind CloudFront, so a WAF web
+  ACL (scope `CLOUDFRONT`, created in us-east-1) can be attached to `ApiDistribution` when needed.
 - S3 lifecycle uses object tags (prefix filters can't wildcard the `<sub>` segment).
 - GSI2 additionally holds push-device items (`PUSHDEVICE#<sub>`) so the notification job can enumerate devices
   without scanning the base table.

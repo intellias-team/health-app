@@ -170,5 +170,11 @@ export const handler = d.lazyHandler(createHandler, async () => ({
   getOuraSecret: d.ouraSecret,
   appScheme: process.env.APP_SCHEME ?? "healthapp",
   usePkce: process.env.OURA_USE_PKCE === "true",
-  redirectUri: process.env.OURA_REDIRECT_URI || undefined,
+  redirectUri: process.env.OURA_REDIRECT_URI || (await ouraRedirectFromPublicUrl()),
 }));
+
+/** `<CloudFront base>/v1/integrations/oura/callback`, or undefined to fall back to the request domain. */
+async function ouraRedirectFromPublicUrl() {
+  const base = await d.publicBaseUrl();
+  return base ? `${base}/v1/integrations/oura/callback` : undefined;
+}

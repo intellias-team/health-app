@@ -64,6 +64,11 @@ export function createHandler(deps) {
 
   return createRouter([
     {
+      // Public liveness check used by deploy smoke tests; touches no user data.
+      method: "GET", path: "/v1/health", public: true,
+      handler: async () => json(200, { status: "ok", stage: process.env.STAGE ?? "local", time: new Date().toISOString() }),
+    },
+    {
       method: "GET", path: "/v1/me",
       handler: async ({ sub }) => {
         const [profile, goals, conns] = await Promise.all([repo.get(profileKey(sub)), repo.get(goalsKey(sub)), connections(sub)]);

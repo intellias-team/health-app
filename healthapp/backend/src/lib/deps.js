@@ -4,7 +4,7 @@
  *
  * Environment:
  *   TABLE_NAME, CATALOG_TABLE_NAME, MEDIA_BUCKET, TOKEN_KEY_ID, OURA_SECRET_ARN, USDA_SECRET_ARN,
- *   OURA_REDIRECT_URI, OURA_QUEUE_URL, PLATFORM_APPLICATION_ARN, BEDROCK_MODEL_ID, BEDROCK_REGION
+ *   OURA_REDIRECT_URI, PUBLIC_BASE_URL_PARAM, OURA_QUEUE_URL, PLATFORM_APPLICATION_ARN, BEDROCK_MODEL_ID, BEDROCK_REGION
  */
 import { createCatalogStore, createDocClient, createRepository } from "./db.js";
 import { createLogger } from "./logger.js";
@@ -49,6 +49,19 @@ export const ouraClient = () => once("oura", async () => {
   const { createOuraClient } = await import("../services/oura.js");
   const s = await ouraSecret();
   return createOuraClient({ clientId: s.clientId, clientSecret: s.clientSecret, redirectUri: env("OURA_REDIRECT_URI", false) });
+});
+
+/**
+ * Public base URL of the API (the CloudFront distribution), read from SSM because the
+ * distribution's domain can't be passed to the functions directly without a template cycle.
+ * @returns {Promise<string|undefined>}
+ */
+export const publicBaseUrl = () => once("publicBaseUrl", async () => {
+  const name = env("PUBLIC_BASE_URL_PARAM", false);
+  if (!name) return undefined;
+  const { SSMClient, GetParameterCommand } = await import("@aws-sdk/client-ssm");
+  const out = await new SSMClient({}).send(new GetParameterCommand({ Name: name }));
+  return out.Parameter?.Value?.replace(/\/+$/, "") || undefined;
 });
 
 export const usdaClient = () => once("usda", async () => {

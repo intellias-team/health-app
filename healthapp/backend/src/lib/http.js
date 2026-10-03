@@ -4,6 +4,7 @@
  * - `sub` is taken ONLY from `event.requestContext.authorizer.jwt.claims.sub` (API §3.5).
  * - Errors are rendered as `{ error: { code, message, details } }` (API §3.1).
  */
+import { timingSafeEqual } from "node:crypto";
 import { createLogger, hashSub } from "./logger.js";
 
 /** Error codes from the API contract, with their default HTTP status. */
@@ -139,6 +140,21 @@ export function errorResponse(err) {
   return json(500, { error: { code: "INTERNAL_ERROR", message: "Internal server error" } });
 }
 
+/** Header CloudFront adds to every origin request (API §3.5). */
+export const ORIGIN_VERIFY_HEADER = "x-origin-verify";
+
+/**
+ * Constant-time check that a request came through the CloudFront distribution.
+ * @param {Record<string,string>} headers lower-cased
+ * @param {string|undefined} secret  undefined/empty disables the check (local tests)
+ */
+export function isFromTrustedOrigin(headers, secret) {
+  if (!secret) return true;
+  const got = Buffer.from(headers[ORIGIN_VERIFY_HEADER] ?? "", "utf8");
+  const want = Buffer.from(secret, "utf8");
+  return got.length === want.length && timingSafeEqual(got, want);
+}
+
 /**
  * Compile a route template like `/v1/meals/{id}` into a matcher.
  * @param {string} template
@@ -180,13 +196,17 @@ export function compilePath(template) {
  * before parameterised routes that could shadow them.
  *
  * @param {Route[]} routes
- * @param {{ logger?: ReturnType<typeof createLogger>, now?: () => number }} [opts]
+ * Requests that did not come through CloudFront (missing/wrong `x-origin-verify`) get 403 when
+ * `opts.originSecret` (default: env ORIGIN_VERIFY_SECRET) is set.
+ *
+ * @param {{ logger?: ReturnType<typeof createLogger>, now?: () => number, originSecret?: string }} [opts]
  * @returns {(event: any, context?: any) => Promise<any>}
  */
 export function createRouter(routes, opts = {}) {
   const logger = opts.logger ?? createLogger();
   const clock = opts.now ?? (() => Date.now());
   const compiled = routes.map((r) => ({ ...r, method: r.method.toUpperCase(), match: compilePath(r.path) }));
+  const originSecret = "originSecret" in opts ? opts.originSecret : process.env.ORIGIN_VERIFY_SECRET;
 
   return async function route(event) {
     const started = clock();
@@ -196,6 +216,9 @@ export function createRouter(routes, opts = {}) {
     try {
       const req = parseEvent(event);
       sub = req.sub;
+      if (!isFromTrustedOrigin(req.headers, originSecret)) {
+        throw new ApiError("FORBIDDEN", "Use the public API endpoint");
+      }
       let pathMatched = false;
       for (const r of compiled) {
         const params = r.match(req.path);

@@ -30,6 +30,14 @@ test("DELETE /v1/me removes every USER# item (batched), the S3 prefix and revoke
   assert.equal(batches.length, 3, "61 items → 25 + 25 + 11");
 });
 
+test("GET /v1/health is public and returns ok", async () => {
+  const { repo } = createTestRepo();
+  const h = createProfile({ repo, media: createFakeMedia(), push: null, logger: silentLogger });
+  const res = parse(await h(apiEvent({ path: "/v1/health", sub: null })));
+  assert.equal(res.status, 200);
+  assert.equal(res.body.status, "ok");
+});
+
 test("profile, goals, connections: public views never leak tokens", async () => {
   const { repo } = createTestRepo();
   const h = createProfile({ repo, media: createFakeMedia(), push: null, logger: silentLogger });
