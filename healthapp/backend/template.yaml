@@ -375,7 +375,7 @@ Resources:
             Effect: Deny
             Principal: "*"
             Action: sqs:*
-            Resource: [!GetAtt OuraWebhookQueue.Arn, !GetAtt OuraWebhookDLQ.Arn]
+            Resource: "*" # SQS queue policies are scoped by `Queues` above; AWS recommends "*" here
             Condition:
               Bool: { aws:SecureTransport: "false" }
 
@@ -520,6 +520,9 @@ Resources:
             - Effect: Allow
               Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Query]
               Resource: [!GetAtt DataTable.Arn, !Sub "${DataTable.Arn}/index/*"]
+            - Effect: Allow
+              Action: [kms:Decrypt, kms:GenerateDataKey]
+              Resource: !GetAtt DataKey.Arn
       Events:
         PostDaily: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: /v1/metrics/daily } }
         GetDaily: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: /v1/metrics/daily } }
@@ -639,6 +642,9 @@ Resources:
             - Effect: Allow
               Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Query]
               Resource: [!GetAtt DataTable.Arn, !Sub "${DataTable.Arn}/index/*"]
+            - Effect: Allow
+              Action: [kms:Decrypt, kms:GenerateDataKey]
+              Resource: !GetAtt DataKey.Arn
       Events:
         Push: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: /v1/sync/push } }
         Pull: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: /v1/sync/pull } }
@@ -728,6 +734,9 @@ Resources:
             - Effect: Allow
               Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query, dynamodb:Scan]
               Resource: [!GetAtt DataTable.Arn, !Sub "${DataTable.Arn}/index/*"]
+            - Effect: Allow
+              Action: [kms:Decrypt, kms:GenerateDataKey]
+              Resource: !GetAtt DataKey.Arn
             - !If
               - HasPush
               - Effect: Allow
@@ -760,6 +769,9 @@ Resources:
             - Effect: Allow
               Action: [dynamodb:Scan, dynamodb:BatchWriteItem]
               Resource: !GetAtt DataTable.Arn
+            - Effect: Allow
+              Action: [kms:Decrypt, kms:GenerateDataKey]
+              Resource: !GetAtt DataKey.Arn
             - Effect: Allow
               Action: s3:DeleteObject
               Resource: !Sub "${MediaBucket.Arn}/users/*/meals/*"
